@@ -10,8 +10,10 @@ import os
 import random
 import signal
 import time
+import collections
 
 import torch
+import torch.optim
 from pytorch_transformers import BertTokenizer
 
 import distributed
@@ -22,6 +24,8 @@ from models.model_builder import AbsSummarizer
 from models.predictor import build_predictor
 from models.trainer import build_trainer
 from others.logging import logger, init_logger
+from models.optimizers import Optimizer
+from utils.safe_loading import safe_model_loading
 
 model_flags = ['hidden_size', 'ff_size', 'heads', 'emb_size', 'enc_layers', 'enc_hidden_size', 'enc_ff_size',
                'dec_layers', 'dec_hidden_size', 'dec_ff_size', 'encoder', 'ff_actv', 'use_interval']
@@ -205,14 +209,47 @@ def load_models_abs(args, device_id, pt, step):
         test_from = args.test_from
     logger.info('Loading checkpoint from %s' % test_from)
 
-    checkpoint = torch.load(test_from, map_location=lambda storage, loc: storage)
-    opt = vars(checkpoint['opt'])
-    for k in opt.keys():
-        if (k in model_flags):
-            setattr(args, k, opt[k])
+    import dill
+    with safe_model_loading():
+        try:
+            # First try loading with weights_only=False
+            checkpoint = torch.load(test_from, map_location=lambda storage, loc: storage)
+            logger.info("Successfully loaded checkpoint with weights_only=False")
+        except Exception as e:
+            logger.info(f"Failed to load with weights_only=False: {str(e)}")
+            try:
+                # Try loading with weights_only=True as fallback
+                checkpoint = torch.load(test_from, map_location=lambda storage, loc: storage)
+                logger.info("Successfully loaded checkpoint with weights_only=True")
+            except Exception as e2:
+                logger.info(f"Failed to load with weights_only=True: {str(e2)}")
+                try:
+                    # Final attempt with dill as pickle module
+                    checkpoint = torch.load(test_from, map_location=lambda storage, loc: storage, pickle_module=dill)
+                    logger.info("Successfully loaded checkpoint with dill pickle module")
+                except Exception as e3:
+                    logger.error(f"All loading attempts failed. Last error: {str(e3)}")
+                    raise RuntimeError("Failed to load model checkpoint after all attempts")
+
+    # Extract model state dict and options
+    if isinstance(checkpoint, dict):
+        if 'model' in checkpoint:
+            model_state_dict = checkpoint['model']
+        else:
+            model_state_dict = checkpoint
+        if 'opt' in checkpoint:
+            opt = vars(checkpoint['opt'])
+            for k in opt.keys():
+                if (k in model_flags):
+                    setattr(args, k, opt[k])
+    else:
+        model_state_dict = checkpoint
+
     print(args)
 
-    model = AbsSummarizer(args, device, checkpoint)
+    # Create model and load state dict
+    model = AbsSummarizer(args, device, None)  # Initialize without checkpoint
+    model.load_state_dict(model_state_dict)
     model.eval()
 
     tokenizer = BertTokenizer.from_pretrained('bert-base-uncased', do_lower_case=True, cache_dir=args.temp_dir)
@@ -230,11 +267,26 @@ def test_abs(args, device_id, pt, step):
         test_from = args.test_from
     logger.info('Loading checkpoint from %s' % test_from)
 
-    checkpoint = torch.load(test_from, map_location=lambda storage, loc: storage)
-    opt = vars(checkpoint['opt'])
-    for k in opt.keys():
-        if (k in model_flags):
-            setattr(args, k, opt[k])
+    from utils.safe_loading import safe_model_loading
+
+    with safe_model_loading():
+        try:
+            checkpoint = torch.load(test_from, map_location=lambda storage, loc: storage)
+        except Exception as e:
+            logger.info(f"Failed to load with weights_only=False: {str(e)}")
+            try:
+                checkpoint = torch.load(test_from, map_location=lambda storage, loc: storage)
+                logger.info("Successfully loaded checkpoint with weights_only=True")
+            except Exception as e2:
+                logger.info(f"Failed to load with weights_only=True: {str(e2)}")
+                checkpoint = torch.load(test_from, map_location=lambda storage, loc: storage, pickle_module=None)
+                logger.info("Successfully loaded checkpoint without pickle module")
+
+    if isinstance(checkpoint, dict) and 'opt' in checkpoint:
+        opt = vars(checkpoint['opt'])
+        for k in opt.keys():
+            if (k in model_flags):
+                setattr(args, k, opt[k])
     print(args)
 
     model = AbsSummarizer(args, device, checkpoint)
@@ -306,13 +358,11 @@ def train_abs_single(args, device_id):
 
     if (args.load_from_extractive != ''):
         logger.info('Loading bert from extractive model %s' % args.load_from_extractive)
-        bert_from_extractive = torch.load(args.load_from_extractive, map_location=lambda storage, loc: storage)
+        bert_from_extractive = torch.load(args.load_from_extractive, 
+                                        map_location=lambda storage, loc: storage)
         bert_from_extractive = bert_from_extractive['model']
     else:
         bert_from_extractive = None
-    torch.manual_seed(args.seed)
-    random.seed(args.seed)
-    torch.backends.cudnn.deterministic = True
 
     def train_iter_fct():
         return data_loader.Dataloader(args, load_dataset(args, 'train', shuffle=True), args.batch_size, device,

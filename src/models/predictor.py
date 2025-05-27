@@ -326,6 +326,7 @@ class Translator(object):
                     topk_beam_index
                     + beam_offset[:topk_beam_index.size(0)].unsqueeze(1))
             select_indices = batch_index.view(-1)
+            select_indices = select_indices.to(torch.long)
 
             # Append last prediction.
             alive_seq = torch.cat(
@@ -370,6 +371,7 @@ class Translator(object):
                     .view(-1, alive_seq.size(-1))
             # Reorder states.
             select_indices = batch_index.view(-1)
+            select_indices = select_indices.to(torch.long)
             src_features = src_features.index_select(0, select_indices)
             dec_states.map_batch_fn(
                 lambda state, dim: state.index_select(dim, select_indices))
